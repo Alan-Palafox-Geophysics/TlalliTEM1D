@@ -104,9 +104,17 @@ class ConfigInversion:
     factor_prof: float = 1.5
     chi2_objetivo: float = 1.0
     lambda_inicial: float = 0.0            # 0 = automático
-    factor_enfriamiento: float = 0.5
+    metodo_lambda: str = "occam"           # occam | enfriamiento
+    occam_tolerancia: float = 0.2          # si χ² objetivo no se alcanza: el más suave con χ² ≤ (1+tol)·χ²_mín
+    occam_n_lambda: int = 9                # λ probados por iteración
+    factor_enfriamiento: float = 0.5       # solo para metodo_lambda = "enfriamiento"
     max_iter: int = 25
-    alfa_cercania: float = 1e-3
+    alfa_cercania: float = 1e-2            # peso del término de cercanía al semiespacio de referencia
+    # Límites de resistividad (multicapa y bloques)
+    limites_automaticos: bool = True       # rango de ρa de los gates usados, ampliado por factor_limites
+    factor_limites: float = 3.0
+    rho_min: float = 0.0                   # Ω·m; se usan si limites_automaticos = False
+    rho_max: float = 0.0
     # Paso 2 · DOI
     calcular_doi: bool = True
     doi_umbral: float = 0.1
@@ -117,6 +125,7 @@ class ConfigInversion:
     k_fijo: int = 0
     criterio: str = "BIC"
     espesor_min_fraccion: float = 0.2
+    desviacion_previa_bloques: float = 0.5  # décadas; previa de cada bloque = media log del multicapa (0 = sin previa)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -240,11 +249,226 @@ def _regularizacion(n: int, alfa: float) -> np.ndarray:
     return np.vstack([suavidad, np.sqrt(alfa) * np.eye(n)])
 
 
+def limites_resistividad(apilado: pd.DataFrame, rho0: float, config: ConfigInversion) -> tuple[float, float]:
+    """Rango de resistividad permitido al modelo (Ω·m).
+
+    Automático: del mínimo al máximo de la ρa tardía de los gates que se
+    invierten, ampliado por ``factor_limites`` (3 ≈ media década) hacia
+    cada lado. La ρa es un promedio de lo que el lazo ve en cada tiempo:
+    una capa real puede ser más extrema que la ρa, pero no órdenes de
+    magnitud más si es lo bastante gruesa para que los datos la vean.
+    """
+    if not config.limites_automaticos and config.rho_min > 0 and config.rho_max > config.rho_min:
+        return float(config.rho_min), float(config.rho_max)
+    else:
+        pass
+    rho_a = apilado.loc[apilado["usar"].astype(bool), "rho_a"] if "rho_a" in apilado else pd.Series(dtype=float)
+    rho_a = rho_a[np.isfinite(rho_a) & (rho_a > 0)]
+    if len(rho_a) < 3:
+        return float(rho0 / 30.0), float(rho0 * 30.0)
+    else:
+        pass
+    factor = max(1.0, float(config.factor_limites))
+    return (float(max(fw.RHO_MIN, rho_a.min() / factor)), float(min(fw.RHO_MAX, rho_a.max() * factor)))
+
+
+def _resolver_acotado(H: np.ndarray, g: np.ndarray, bajo: float, alto: float, max_pasadas: int = 10) -> np.ndarray:
+    """Resuelve H m = g con bajo ≤ m ≤ alto por conjunto activo.
+
+    Recortar la solución libre (``np.clip``) no es el mínimo del problema
+    acotado: las celdas recortadas dejan de explicar su parte de los datos
+    y nadie la redistribuye. Aquí las celdas que violan un límite se fijan
+    en él y se vuelve a resolver para las demás, hasta que ninguna viole.
+    """
+    n = len(g)
+    fijas = np.zeros(n, dtype=bool)
+    valores = np.zeros(n)
+    m = np.linalg.solve(H, g)
+    for _ in range(max_pasadas):
+        viola_bajo = ~fijas & (m < bajo)
+        viola_alto = ~fijas & (m > alto)
+        if not (viola_bajo.any() or viola_alto.any()):
+            break
+        else:
+            pass
+        valores[viola_bajo] = bajo
+        valores[viola_alto] = alto
+        fijas |= viola_bajo | viola_alto
+        libres = ~fijas
+        m = valores.copy()
+        if libres.any():
+            m[libres] = np.linalg.solve(H[np.ix_(libres, libres)], g[libres] - H[np.ix_(libres, fijas)] @ valores[fijas])
+        else:
+            pass
+    return np.clip(m, bajo, alto)
+
+
+def _occam(datos: DatosInversion, espesores: np.ndarray, m_ref: np.ndarray, config: ConfigInversion,
+           limites_ln: tuple[float, float], verificar: Optional[Callable] = None) -> dict[str, Any]:
+    """Inversión de Occam (Constable et al., 1987) con límites de resistividad.
+
+    En cada iteración se linealiza en el modelo actual y se resuelve el
+    modelo completo ("jumping", no un paso) para varios λ:
+
+        (JᵀJ + λRᵀR) m' = Jᵀ(r + J m) + λRᵀR m_ref
+
+    y se calcula el χ² **real** (modelado directo) de cada candidato. Dos
+    fases, como en el Occam original:
+
+    1. **Bajar el desajuste.** Mientras el objetivo no se alcance, se toma
+       el candidato de menor χ² (entre los que quedan a menos de 2 % de él,
+       el de λ más grande). La fase termina al llegar al objetivo o cuando
+       χ² deja de bajar (< 2 % en dos iteraciones): ese es el χ² mínimo
+       alcanzable con estos datos y estos límites.
+    2. **Suavizar.** Objetivo = max(χ² objetivo, (1 + tolerancia) × χ²
+       mínimo) y se toma el **λ más grande** que lo cumple: el modelo más
+       suave compatible con los datos. Si χ² = 1 no se alcanza (error
+       sistemático, efectos no 1D) no se deja que λ baje solo para ganar
+       décimas de χ² a costa de capas de 0.5 y 500 Ω·m.
+
+    R combina rugosidad (primera diferencia de ln ρ) y cercanía al
+    semiespacio de referencia (``alfa_cercania``). Cada candidato respeta
+    ``limites_ln`` por conjunto activo (:func:`_resolver_acotado`).
+    """
+    n = len(m_ref)
+    R = _regularizacion(n, config.alfa_cercania)
+    RtR = R.T @ R
+    bajo, alto = limites_ln
+    m = np.clip(np.array(m_ref, float), bajo, alto)
+    calculado, J = datos.modelo.jacobiano_rho(np.exp(m), espesores)
+    w = 1.0 / datos.sigma_ln
+    Jw = J / calculado[:, None] * w[:, None]
+    lam = float(config.lambda_inicial) if config.lambda_inicial > 0 else \
+        10.0 * float(np.trace(Jw.T @ Jw) / np.trace(RtR))
+    lam_max, lam_min = lam * 1e3, lam * 1e-6
+    chi2 = datos.chi2(calculado)
+    historial, modelos = [], []
+    fase, chi2_minimo, sin_mejora = 1, np.inf, 0
+    for iteracion in range(1, int(config.max_iter) + 1):
+        if verificar is not None:
+            verificar()
+        else:
+            pass
+        fase_iteracion = fase
+        r = datos.residuales(calculado)
+        Jw = J / calculado[:, None] * w[:, None]
+        A = Jw.T @ Jw
+        b_datos = Jw.T @ (r + Jw @ m)
+        candidatos = []
+        exponentes = np.linspace(-2.0, 1.0, max(3, int(config.occam_n_lambda)))
+        for lam_c in np.clip(lam * 10.0 ** exponentes, lam_min, lam_max):
+            try:
+                m_c = _resolver_acotado(A + lam_c * RtR, b_datos + lam_c * RtR @ m_ref, bajo, alto)
+            except np.linalg.LinAlgError:
+                continue
+            calc_c = datos.modelo.respuesta(np.exp(m_c), espesores)
+            candidatos.append((float(lam_c), m_c, calc_c, datos.chi2(calc_c)))
+        if not candidatos:
+            break
+        else:
+            pass
+        chi2_c = np.array([c[3] for c in candidatos])
+        elegido_c = None
+        if fase == 1:
+            # Fase 1: solo se acepta si baja el χ²; si el salto completo
+            # empeora (problema no lineal lejos de la solución), se acorta
+            # el paso hacia el mejor candidato.
+            if chi2_c.min() < chi2:
+                cerca = [c for c in candidatos if c[3] <= 1.02 * chi2_c.min()]
+                elegido_c = max(cerca, key=lambda c: c[0])
+            else:
+                lam_b, m_b = candidatos[int(np.argmin(chi2_c))][:2]
+                for t in (0.5, 0.25):
+                    m_t = m + t * (m_b - m)
+                    calc_t = datos.modelo.respuesta(np.exp(m_t), espesores)
+                    if datos.chi2(calc_t) < chi2:
+                        elegido_c = (lam_b, m_t, calc_t, datos.chi2(calc_t))
+                        break
+                    else:
+                        pass
+            if elegido_c is not None:
+                sin_mejora = sin_mejora + 1 if elegido_c[3] > 0.98 * chi2 else 0
+            else:
+                pass
+            # Fin de la fase 1: objetivo alcanzado, sin paso que mejore, o
+            # dos iteraciones seguidas mejorando menos de 2 %.
+            if elegido_c is None or elegido_c[3] <= config.chi2_objetivo or sin_mejora >= 2:
+                fase = 2
+            else:
+                pass
+        else:
+            # Fase 2: el λ más grande que cumple el objetivo relajado.
+            objetivo = max(config.chi2_objetivo, (1.0 + config.occam_tolerancia) * chi2_minimo)
+            cumplen = [c for c in candidatos if c[3] <= objetivo]
+            if cumplen:
+                elegido_c = max(cumplen, key=lambda c: c[0])
+            else:
+                pass
+        chi2_minimo = min(chi2_minimo, chi2, float(chi2_c.min()) if elegido_c is not None else chi2)
+        if elegido_c is None:
+            # Ningún candidato mejora (fase 1) ni cumple el objetivo (fase 2):
+            # el modelo actual es el resultado de esa fase.
+            if fase_iteracion == 2:
+                break
+            else:
+                continue
+        else:
+            pass
+        lam_n, m_n, calc_n, chi2_n = elegido_c
+        cambio_m = float(np.sqrt(np.mean((m_n - m) ** 2)))
+        m, lam = m_n, lam_n
+        calculado, J = datos.modelo.jacobiano_rho(np.exp(m), espesores)
+        chi2 = datos.chi2(calculado)
+        chi2_minimo = min(chi2_minimo, chi2)
+        historial.append({"iteracion": iteracion, "fase": fase_iteracion,
+                          "chi2": chi2, "lambda": lam, "rugosidad": float(np.sum(np.diff(m) ** 2)),
+                          "objetivo": max(config.chi2_objetivo, (1.0 + config.occam_tolerancia) * chi2_minimo),
+                          "paso_aceptado": True})
+        modelos.append((m.copy(), calculado.copy(), J.copy(), chi2, lam))
+        if fase == 2 and cambio_m < 0.01:
+            break
+        else:
+            pass
+    if not modelos:
+        modelos.append((m.copy(), calculado.copy(), J.copy(), chi2, lam))
+        historial.append({"iteracion": 0, "fase": 1, "chi2": chi2, "lambda": lam,
+                          "rugosidad": float(np.sum(np.diff(m) ** 2)), "objetivo": config.chi2_objetivo,
+                          "paso_aceptado": False})
+    else:
+        pass
+    historial = pd.DataFrame(historial)
+    # Elección final: el modelo más suave (menor rugosidad) entre los que
+    # cumplen el objetivo final de la búsqueda.
+    chi2s = historial["chi2"].to_numpy()
+    objetivo_final = max(config.chi2_objetivo, (1.0 + config.occam_tolerancia) * min(float(chi2s.min()), chi2_minimo))
+    elegibles = np.where(chi2s <= objetivo_final)[0]
+    if len(elegibles):
+        elegido = int(elegibles[np.argmin(historial["rugosidad"].to_numpy()[elegibles])])
+    else:
+        elegido = int(np.argmin(chi2s))
+    historial["elegido"] = historial.index == elegido
+    m, calculado, J, chi2, lam = modelos[elegido]
+    if chi2 <= config.chi2_objetivo:
+        criterio = "Occam: el más suave con χ² ≤ objetivo"
+    else:
+        criterio = (f"Occam: χ² = {config.chi2_objetivo:g} no se alcanza; el más suave con χ² ≤ "
+                    f"{1 + config.occam_tolerancia:.2f} × el mínimo ({chi2s.min():.2f})")
+    return {"m": m, "calculado": calculado, "J": J, "chi2": chi2, "lambda": lam,
+            "historial": historial, "criterio": criterio}
+
+
 def invertir_suave(datos: DatosInversion, espesores: np.ndarray, m_ref: np.ndarray, config: ConfigInversion,
                    m_inicial: Optional[np.ndarray] = None, lam_fijo: Optional[float] = None,
                    alfa: Optional[float] = None, max_iter: Optional[int] = None,
-                   verificar: Optional[Callable] = None) -> dict[str, Any]:
-    """Gauss–Newton regularizado con enfriamiento de λ.
+                   verificar: Optional[Callable] = None,
+                   limites_ln: Optional[tuple[float, float]] = None) -> dict[str, Any]:
+    """Multicapa suave: Occam (por omisión) o Gauss–Newton enfriando λ.
+
+    Con ``lam_fijo`` (inversiones de la DOI) siempre se usa Gauss–Newton
+    con λ fijo y sin límites de resistividad: la DOI mide qué tanto los
+    datos controlan cada celda y los límites la falsearían.
+
+    Método por enfriamiento (``metodo_lambda = "enfriamiento"``):
 
     - Una iteración de Gauss–Newton por cada λ; λ se multiplica por
       ``factor_enfriamiento`` hasta que χ²/N ≤ objetivo.
@@ -253,6 +477,11 @@ def invertir_suave(datos: DatosInversion, espesores: np.ndarray, m_ref: np.ndarr
       está a menos de 10 % del mínimo alcanzado.
     - Con ``lam_fijo`` no se enfría λ (inversiones de la DOI).
     """
+    if lam_fijo is None and config.metodo_lambda == "occam":
+        return _occam(datos, espesores, m_ref, config, limites_ln or (LN_RHO_MIN, LN_RHO_MAX), verificar)
+    else:
+        pass
+    bajo, alto = limites_ln or (LN_RHO_MIN, LN_RHO_MAX)
     n = len(m_ref)
     R = _regularizacion(n, config.alfa_cercania if alfa is None else alfa)
     RtR = R.T @ R
@@ -283,7 +512,7 @@ def invertir_suave(datos: DatosInversion, espesores: np.ndarray, m_ref: np.ndarr
         phi_actual = np.sum(r ** 2) + lam * np.sum((R @ (m - m_ref)) ** 2)
         aceptado = False
         for escala in (1.0, 0.5, 0.25, 0.125):
-            m_nuevo = np.clip(m + escala * paso, LN_RHO_MIN, LN_RHO_MAX)
+            m_nuevo = np.clip(m + escala * paso, bajo, alto)
             calc_nuevo = datos.modelo.respuesta(np.exp(m_nuevo), espesores)
             r_nuevo = datos.residuales(calc_nuevo)
             phi_nuevo = np.sum(r_nuevo ** 2) + lam * np.sum((R @ (m_nuevo - m_ref)) ** 2)
@@ -451,7 +680,7 @@ PESO_TOPE_PROFUNDIDAD = 30.0
 
 def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
                      param: _Parametrizacion, limites_ln_rho: tuple[float, float],
-                     z_tope: float = np.inf) -> dict[str, Any]:
+                     z_tope: float = np.inf, sigma_previa: float = 0.0) -> dict[str, Any]:
     """Ajuste de un modelo de k bloques por mínimos cuadrados acotados.
 
     ``z_tope`` es la profundidad máxima permitida a la última interfaz
@@ -460,6 +689,12 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
     ``w`` admite hasta e¹² veces la profundidad anterior y el ajuste no
     cambia. El tope se aplica como penalización tipo bisagra sobre
     ln z_última (su derivada respecto a cada ``w`` vale 1).
+
+    ``sigma_previa`` (en ln ρ; 0 = sin previa) agrega para cada bloque el
+    residual (ln ρ − ln ρ_previa)/σ, con ρ_previa = la media logarítmica
+    del multicapa en la profundidad del bloque (``ln_rho0`` de la
+    segmentación). Es una regularización tipo Tíjonov hacia el modelo
+    suave: un bloque solo se aleja de él si los datos lo piden.
     """
     from scipy.optimize import least_squares
 
@@ -470,6 +705,8 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
         pass
     w0 = param.desde_profundidades(z0)
     ln_tope = np.log(z_tope) if np.isfinite(z_tope) else np.inf
+    ln_previa = np.asarray(ln_rho0, float).copy()
+    con_previa = sigma_previa > 0
 
     def exceso(w):
         return max(0.0, float(np.log(param.a_profundidades(w)[-1])) - ln_tope) if k > 1 else 0.0
@@ -483,7 +720,12 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
     def residual(p):
         ln_rho, w = separar(p)
         r = -datos.residuales(datos.modelo.respuesta_bloques(np.exp(ln_rho), espesores(w)))
-        return np.append(r, PESO_TOPE_PROFUNDIDAD * exceso(w))
+        r = np.append(r, PESO_TOPE_PROFUNDIDAD * exceso(w))
+        if con_previa:
+            r = np.concatenate([r, (ln_rho - ln_previa) / sigma_previa])
+        else:
+            pass
+        return r
 
     def jacobiano(p):
         ln_rho, w = separar(p)
@@ -497,7 +739,12 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
             fila_tope[k:] = PESO_TOPE_PROFUNDIDAD
         else:
             pass
-        return np.vstack([np.hstack([J_rho, J_w]), fila_tope])
+        J_total = np.vstack([np.hstack([J_rho, J_w]), fila_tope])
+        if con_previa:
+            J_total = np.vstack([J_total, np.hstack([np.eye(k) / sigma_previa, np.zeros((k, k - 1))])])
+        else:
+            pass
+        return J_total
 
     bajo, alto = limites_ln_rho
     p0 = np.concatenate([np.clip(ln_rho0, bajo + 0.01, alto - 0.01), w0])
@@ -510,30 +757,41 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
     h = espesores(w)
     d, J = datos.modelo.jacobiano_bloques(np.exp(ln_rho), h)
     return {"ln_rho": ln_rho, "espesores": h, "calculado": d, "J": J,
-            "phi": float(np.sum(datos.residuales(d) ** 2)), "chi2": datos.chi2(d)}
+            "phi": float(np.sum(datos.residuales(d) ** 2)), "chi2": datos.chi2(d),
+            "sigma_previa": sigma_previa}
 
 
 def _incertidumbre(datos: DatosInversion, ajuste: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     """σ de ln ρ y de ln h a partir de la covarianza linealizada."""
     escala = (1.0 / datos.sigma_ln / ajuste["calculado"])[:, None]
     Jw = ajuste["J"] * escala
+    k = len(ajuste["ln_rho"])
+    informacion = Jw.T @ Jw
+    sigma_previa = float(ajuste.get("sigma_previa", 0.0) or 0.0)
+    if sigma_previa > 0:
+        # La previa también informa la resistividad de cada bloque: sin
+        # ella, una capa que los datos no ven saldría con ±8 décadas.
+        informacion[:k, :k] += np.eye(k) / sigma_previa ** 2
+    else:
+        pass
     try:
-        covarianza = np.linalg.pinv(Jw.T @ Jw) * max(1.0, ajuste["chi2"])
+        covarianza = np.linalg.pinv(informacion) * max(1.0, ajuste["chi2"])
         sigma = np.sqrt(np.clip(np.diag(covarianza), 0, None))
     except np.linalg.LinAlgError:
         sigma = np.full(Jw.shape[1], np.nan)
-    k = len(ajuste["ln_rho"])
     return sigma[:k], sigma[k:]
 
 
 def invertir_bloques(datos: DatosInversion, espesores_suave: np.ndarray, m_suave: np.ndarray,
                      z_limite: float, config: ConfigInversion, chi2_suave: float = 1.0,
-                     verificar: Optional[Callable] = None) -> tuple[dict[str, Any], pd.DataFrame, list[str]]:
+                     verificar: Optional[Callable] = None,
+                     limites_ln: Optional[tuple[float, float]] = None) -> tuple[dict[str, Any], pd.DataFrame, list[str]]:
     """Modelos de 2…k_max capas y elección por criterio de información.
 
-    - La resistividad de cada bloque se acota a una década por debajo y por
-      encima del rango del multicapa: evita capas "fantasma" de 10⁴ Ω·m que
-      ningún dato exige.
+    - La resistividad de cada bloque se acota a ``limites_ln`` (los mismos
+      del multicapa) y se regulariza hacia la media logarítmica del
+      multicapa en su profundidad (``desviacion_previa_bloques`` décadas):
+      evita capas "fantasma" de 10⁴ o 0.1 Ω·m que ningún dato exige.
     - Si el multicapa no alcanzó el nivel de ruido (χ² > 1), los criterios
       de información se calculan con los errores escalados por √χ²: así la
       penalización por capa se compara con un ajuste realista y no se
@@ -541,8 +799,12 @@ def invertir_bloques(datos: DatosInversion, espesores_suave: np.ndarray, m_suave
     """
     n = len(datos.observado)
     escala = max(1.0, float(chi2_suave))
-    limites = (max(LN_RHO_MIN, float(m_suave.min()) - np.log(10.0)),
-               min(LN_RHO_MAX, float(m_suave.max()) + np.log(10.0)))
+    if limites_ln is not None:
+        limites = limites_ln
+    else:
+        limites = (max(LN_RHO_MIN, float(m_suave.min()) - np.log(10.0)),
+                   min(LN_RHO_MAX, float(m_suave.max()) + np.log(10.0)))
+    sigma_previa = float(config.desviacion_previa_bloques) * np.log(10.0)
     param = _Parametrizacion(h_min=float(espesores_suave[0]), fraccion=config.espesor_min_fraccion)
     z_tope = float(np.sum(espesores_suave))  # fondo de la malla del multicapa
     valores_k = [int(config.k_fijo)] if config.k_fijo >= 2 else list(range(2, int(config.k_max) + 1))
@@ -557,7 +819,7 @@ def invertir_bloques(datos: DatosInversion, espesores_suave: np.ndarray, m_suave
         for etiqueta, factor in (("segmentación del multicapa", 1.0), ("interfaces × 0.7", 0.7),
                                  ("interfaces × 1.4", 1.4)):
             try:
-                ajuste = _ajustar_bloques(datos, ln_rho0, z0 * factor, param, limites, z_tope)
+                ajuste = _ajustar_bloques(datos, ln_rho0, z0 * factor, param, limites, z_tope, sigma_previa)
             except Exception as exc:  # un arranque malo no detiene la búsqueda
                 logger.warning("k=%d, arranque %s falló: %s", k, etiqueta, exc)
                 continue
@@ -677,12 +939,27 @@ def invertir_sondeo(apilado: pd.DataFrame, formas_onda: pd.DataFrame, barridos: 
                    f"error = error estándar del apilado ⊕ {100 * cfg.error_relativo_minimo:.0f} % del dato; "
                    f"gates {'integrados' if cfg.integrar_gates else 'en su centro'}; forma de onda del archivo.")
 
-    m_ref = np.full(cfg.n_capas, np.log(rho0))
-    suave = invertir_suave(datos, espesores, m_ref, cfg, verificar=verificar_cancelacion)
+    rho_lim = limites_resistividad(apilado, rho0, cfg)
+    limites_ln = (float(np.log(rho_lim[0])), float(np.log(rho_lim[1])))
+    m_ref = np.full(cfg.n_capas, np.clip(np.log(rho0), *limites_ln))
+    suave = invertir_suave(datos, espesores, m_ref, cfg, verificar=verificar_cancelacion, limites_ln=limites_ln)
+    metodo = "Occam (λ más grande que cumple el objetivo en cada iteración)" if cfg.metodo_lambda == "occam" \
+        else "Gauss–Newton enfriando λ"
+    origen_lim = (f"ρa de los gates usados ÷/× {cfg.factor_limites:g}" if cfg.limites_automaticos
+                  else "fijados por el usuario")
     proceso.append(f"Paso 1 · multicapa: {cfg.n_capas} capas logarítmicas de {espesores[0]:.1f} m a "
-                   f"{z_max:.0f} m, arranque en semiespacio de {rho0:.1f} Ω·m (ρa tardía mediana); "
-                   f"{len(suave['historial'])} iteraciones de Gauss–Newton enfriando λ; modelo elegido por "
-                   f"{suave['criterio']}: χ² = {suave['chi2']:.2f}, λ = {suave['lambda']:.3g}.")
+                   f"{z_max:.0f} m, referencia y arranque en semiespacio de {np.exp(m_ref[0]):.1f} Ω·m "
+                   f"(ρa tardía mediana); ρ limitada a {rho_lim[0]:.3g}–{rho_lim[1]:.3g} Ω·m ({origen_lim}); "
+                   f"rugosidad + cercanía (α = {cfg.alfa_cercania:g}); {metodo}, {len(suave['historial'])} "
+                   f"iteraciones; {suave['criterio']}: χ² = {suave['chi2']:.2f}, λ = {suave['lambda']:.3g}.")
+    en_limite = int(np.sum((suave["m"] <= limites_ln[0] + 1e-6) | (suave["m"] >= limites_ln[1] - 1e-6)))
+    if en_limite:
+        advertencias.append(
+            f"{en_limite} celda(s) del multicapa quedaron en el límite de resistividad "
+            f"({rho_lim[0]:.3g}–{rho_lim[1]:.3g} Ω·m): los datos piden valores más extremos. Suele ser un tramo "
+            "de datos que el modelo 1D no explica (meseta tardía, repuntes): revise el QC antes de ampliar los límites.")
+    else:
+        pass
     if suave["chi2"] > 2 * cfg.chi2_objetivo:
         advertencias.append(f"El multicapa no alcanza el nivel de ruido (χ² = {suave['chi2']:.2f}): error "
                             "subestimado, gates con efectos no 1D o acoplamiento.")
@@ -706,13 +983,15 @@ def invertir_sondeo(apilado: pd.DataFrame, formas_onda: pd.DataFrame, barridos: 
 
     z_limite = doi if doi else z_max
     mejor, seleccion, notas = invertir_bloques(datos, espesores, suave["m"], z_limite, cfg,
-                                               chi2_suave=suave["chi2"], verificar=verificar_cancelacion)
+                                               chi2_suave=suave["chi2"], verificar=verificar_cancelacion,
+                                               limites_ln=limites_ln)
     advertencias += notas
     sigma_rho, sigma_h = _incertidumbre(datos, mejor)
     bloques = _tabla_bloques(mejor, sigma_rho, sigma_h, doi)
     proceso.append(f"Paso 3 · bloques: k = {', '.join(map(str, seleccion['k']))} ajustados por mínimos cuadrados "
                    f"acotados (espesor mínimo: {espesores[0]:.1f} m la primera capa y "
-                   f"{100 * cfg.espesor_min_fraccion:.0f} % de la profundidad del techo las demás); "
+                   f"{100 * cfg.espesor_min_fraccion:.0f} % de la profundidad del techo las demás; ρ en los mismos "
+                   f"límites y previa de ±{cfg.desviacion_previa_bloques:g} década(s) alrededor del multicapa); "
                    f"{cfg.criterio} elige {len(bloques)} capas (arranque: {mejor['arranque']}), χ² = {mejor['chi2']:.2f}.")
     if bloques["bajo_doi"].any():
         proceso.append(f"{int(bloques['bajo_doi'].sum())} capa(s) del modelo de bloques empiezan por debajo de la DOI: "
@@ -730,6 +1009,7 @@ def invertir_sondeo(apilado: pd.DataFrame, formas_onda: pd.DataFrame, barridos: 
         "bloques_n_capas": int(len(bloques)), "bloques_chi2": mejor["chi2"],
         "bloques_rms": float(100 * np.sqrt(np.mean((usados["error_bloques_pct"] / 100) ** 2))),
         "criterio": cfg.criterio, "doi": doi if doi else np.nan, "duracion_s": time.time() - inicio,
+        "rho_limite_min": rho_lim[0], "rho_limite_max": rho_lim[1], "celdas_en_limite": en_limite,
     }
     return ResultadoInversion(
         multicapa=multicapa, bloques=bloques, ajuste=ajuste, seleccion=seleccion,

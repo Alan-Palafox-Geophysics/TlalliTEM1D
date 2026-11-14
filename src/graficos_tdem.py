@@ -784,6 +784,11 @@ def proceso_inversion(iteraciones: Optional[pd.DataFrame]) -> go.Figure:
                                     marker=dict(size=15, symbol="star", color=COLOR["anomalo"])), secondary_y=False)
     else:
         pass
+    if "objetivo" in it and it["objetivo"].notna().any():
+        figura.add_trace(go.Scatter(x=it["iteracion"], y=it["objetivo"], mode="lines", name="χ² objetivo (Occam)",
+                                    line=dict(color=COLOR["multicapa"], dash="dash", width=1)), secondary_y=False)
+    else:
+        pass
     figura.add_hline(y=1.0, line=dict(color="#999", dash="dash"), secondary_y=False)
     figura.update_yaxes(type="log", title="χ²", secondary_y=False)
     figura.update_yaxes(type="log", title="λ", secondary_y=True)

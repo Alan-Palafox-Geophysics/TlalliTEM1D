@@ -110,7 +110,13 @@ with st.container(border=True):
         ci.aplicar_factor_campo = st.checkbox("Multiplicar por FIELD_SHIFT_FACTOR", value=bool(ci.aplicar_factor_campo),
                                               key="chk_fsf", help="Calibración del fabricante; por omisión 1.")
 
-    st.markdown("**Paso 1 · Multicapa suave**")
+    st.markdown("**Paso 1 · Multicapa suave (regularización)**")
+    st.caption(
+        "**Occam**: en cada iteración se prueban varios λ con el modelado directo real y se queda el más grande "
+        "(modelo más suave) que cumple el χ² objetivo. Si χ² = 1 no se alcanza, el objetivo es (1 + tolerancia) × "
+        "el mínimo alcanzable: una tolerancia mayor da modelos más suaves y con menos contrastes. La resistividad "
+        "queda dentro de límites: por omisión el rango de ρa de los gates invertidos ÷/× un factor."
+    )
     c1 = st.columns(4)
     ci.n_capas = int(c1[0].number_input("Número de capas", 10, 60, int(ci.n_capas), key="n_capas"))
     ci.prof_max = float(c1[1].number_input("Profundidad máxima (m, 0 = automática)", 0.0, 5000.0,
@@ -118,6 +124,32 @@ with st.container(border=True):
                                            help="Automática: factor × profundidad de difusión del último gate."))
     ci.chi2_objetivo = float(c1[2].number_input("χ² objetivo", 0.5, 5.0, float(ci.chi2_objetivo), 0.1, key="n_chi2"))
     ci.max_iter = int(c1[3].number_input("Iteraciones máximas", 5, 60, int(ci.max_iter), key="n_iter"))
+    c1b = st.columns(4)
+    METODOS = {"occam": "Occam (recomendado)", "enfriamiento": "Enfriamiento de λ (versión anterior)"}
+    ci.metodo_lambda = c1b[0].selectbox("Selección de λ", list(METODOS), index=list(METODOS).index(ci.metodo_lambda),
+                                        format_func=lambda k: METODOS[k], key="sel_metlam")
+    ci.occam_tolerancia = float(c1b[1].number_input(
+        "Tolerancia de χ² (%)", 0.0, 200.0, float(100 * ci.occam_tolerancia), 5.0, key="n_tol",
+        help="Cuánto peor que el mínimo alcanzable se acepta el ajuste a cambio de un modelo más suave.")) / 100
+    ci.alfa_cercania = float(c1b[2].number_input(
+        "Peso de cercanía a la referencia (α)", 0.0, 1.0, float(ci.alfa_cercania), 0.005, format="%.3f",
+        key="n_alfa", help="Atrae las celdas sin control de los datos al semiespacio de ρa tardía mediana. "
+                           "0 = solo rugosidad."))
+    ci.limites_automaticos = c1b[3].checkbox("Límites de ρ automáticos", value=bool(ci.limites_automaticos),
+                                             key="chk_limauto")
+    c1c = st.columns(4)
+    ci.factor_limites = float(c1c[0].number_input(
+        "Factor sobre el rango de ρa", 1.0, 100.0, float(ci.factor_limites), 0.5, key="n_flim",
+        disabled=not ci.limites_automaticos, help="3 ≈ media década por debajo del mínimo y por encima del "
+                                                  "máximo de la ρa tardía de los gates invertidos."))
+    ci.rho_min = float(c1c[1].number_input("ρ mínima (Ω·m)", 0.0, 1e5, float(ci.rho_min), 0.5, key="n_rhomin",
+                                           disabled=bool(ci.limites_automaticos)))
+    ci.rho_max = float(c1c[2].number_input("ρ máxima (Ω·m)", 0.0, 1e6, float(ci.rho_max), 10.0, key="n_rhomax",
+                                           disabled=bool(ci.limites_automaticos)))
+    if not ci.limites_automaticos and not (0 < ci.rho_min < ci.rho_max):
+        c1c[3].warning("Límites manuales inválidos: se usarán los automáticos.")
+    else:
+        pass
 
     st.markdown("**Paso 2 · DOI**")
     c2 = st.columns(3)
@@ -134,6 +166,12 @@ with st.container(border=True):
                                   help="BIC penaliza más cada capa (modelos más simples); AIC es más permisivo.")
     ci.espesor_min_fraccion = float(c3[3].slider("Espesor mínimo (fracción de la prof. del techo)", 0.0, 1.0,
                                                  float(ci.espesor_min_fraccion), 0.05, key="sl_hmin"))
+    c3b = st.columns(4)
+    ci.desviacion_previa_bloques = float(c3b[0].number_input(
+        "Rigidez de los bloques: ± décadas alrededor del multicapa", 0.0, 3.0, float(ci.desviacion_previa_bloques),
+        0.1, key="n_previa",
+        help=("Cada bloque se regulariza hacia la media logarítmica del multicapa en su profundidad. Menor = más "
+              "rígido (0.5 ≈ factor 3). 0 = sin regularización (solo los límites).")))
     config.inversion = ci
     estado.fijar_config(config)
 
@@ -197,7 +235,10 @@ t = st.columns(6)
 t[0].metric("Datos invertidos", int(metricas.get("inversion.n_datos", 0)))
 t[1].metric("Multicapa χ²", f"{metricas.get('inversion.multicapa_chi2', np.nan):.2f}",
             help=f"RMS {metricas.get('inversion.multicapa_rms', np.nan):.1f} %")
-t[2].metric("λ", f"{metricas.get('inversion.multicapa_lambda', np.nan):.3g}")
+t[2].metric("λ", f"{metricas.get('inversion.multicapa_lambda', np.nan):.3g}",
+            help=f"Límites de ρ: {metricas.get('inversion.rho_limite_min', np.nan):.3g}–"
+                 f"{metricas.get('inversion.rho_limite_max', np.nan):.3g} Ω·m; celdas en el límite: "
+                 f"{int(metricas.get('inversion.celdas_en_limite', 0) or 0)}.")
 t[3].metric("Bloques", f"{int(metricas.get('inversion.bloques_n_capas', 0))} capas")
 t[4].metric("Bloques χ²", f"{metricas.get('inversion.bloques_chi2', np.nan):.2f}",
             help=f"RMS {metricas.get('inversion.bloques_rms', np.nan):.1f} %")

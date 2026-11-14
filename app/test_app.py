@@ -290,18 +290,48 @@ def prueba_segmentacion():
     assert np.allclose(np.exp(ln_rho), [10, 100, 20]) and np.allclose(interfaces, [15, 30])
 
 
+def prueba_resolver_acotado():
+    # El conjunto activo debe dar el mismo mínimo que un solver de mínimos
+    # cuadrados acotados de referencia (scipy.lsq_linear).
+    from scipy.optimize import lsq_linear
+
+    rng = np.random.default_rng(3)
+    A = rng.normal(size=(40, 12))
+    R = np.diff(np.eye(12), axis=0)
+    H = A.T @ A + 2.0 * R.T @ R
+    g = A.T @ rng.normal(0, 3, 40)
+    m = inv._resolver_acotado(H, g, -0.5, 0.5)
+    L = np.linalg.cholesky(H)
+    referencia = lsq_linear(L.T, np.linalg.solve(L, g), bounds=(-0.5, 0.5)).x
+    assert m.min() >= -0.5 - 1e-12 and m.max() <= 0.5 + 1e-12
+    objetivo = lambda x: 0.5 * x @ H @ x - g @ x  # noqa: E731
+    assert objetivo(m) <= objetivo(referencia) + 1e-6 * abs(objetivo(referencia))
+
+
+def prueba_limites_resistividad():
+    apilado = pd.DataFrame({"usar": [True, True, True, False], "rho_a": [5.0, 20.0, 50.0, 0.01]})
+    cfg = inv.ConfigInversion(factor_limites=3.0)
+    bajo, alto = inv.limites_resistividad(apilado, 20.0, cfg)
+    assert np.isclose(bajo, 5.0 / 3.0) and np.isclose(alto, 150.0)
+    manual = inv.ConfigInversion(limites_automaticos=False, rho_min=2.0, rho_max=400.0)
+    assert inv.limites_resistividad(apilado, 20.0, manual) == (2.0, 400.0)
+
+
 def prueba_inversion_sintetica():
     if RAPIDO:
         return None
     else:
         pass
     tablas = _tablas("SINT_001")
-    apilado = pr.apilar(tablas.gates, tablas.barridos, pr.ConfigProcesamiento())
+    apilado = pr.agregar_rho_a(pr.apilar(tablas.gates, tablas.barridos, pr.ConfigProcesamiento(), 1600.0), 1600.0)
     resultado = inv.invertir_sondeo(apilado, tablas.forma_onda, tablas.barridos, fw.GeometriaLazo(40, 40),
                                     inv.ConfigInversion(calcular_doi=False))
     bloques = resultado.bloques
     _, espesores, rho, _ = gs.SONDEOS[0]
     assert resultado.metricas["multicapa_chi2"] < 2.0
+    bajo, alto = resultado.metricas["rho_limite_min"], resultado.metricas["rho_limite_max"]
+    for modelo in (resultado.multicapa, bloques):
+        assert modelo["rho"].min() >= bajo * 0.999 and modelo["rho"].max() <= alto * 1.001
     # La capa conductora (8 Ω·m entre 20 y 60 m) debe recuperarse.
     conductora = bloques.loc[bloques["rho"].idxmin()]
     assert abs(conductora["rho"] / rho[1] - 1) < 0.2, bloques

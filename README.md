@@ -34,7 +34,7 @@ sirven las mismas cuentas.
 Pruebas sin navegador:
 
 ```bash
-python app/test_app.py          # 24 pruebas, ~1 min
+python app/test_app.py          # 26 pruebas, ~3 min
 python app/test_app.py rapido   # sin las inversiones completas, ~6 s
 ```
 
@@ -42,6 +42,25 @@ Datos de ejemplo: `python ejemplos/generar_sintetico_tdem.py` escribe en
 `ejemplos/sinteticos/` tres USF sintéticos (40 barridos LM + 40 HM, con ruido) y el archivo
 `coordenadas_ejemplo.csv`. El tercer sondeo no trae GPS, para probar la captura manual de
 coordenadas.
+
+## ¿SimPEG o pyGIMLi?
+
+El **modelado directo y el jacobiano** se calculan con **SimPEG**: `Simulation1DLayered` del módulo
+`electromagnetics.time_domain`. El ciclo de inversión (Occam, DOI, bloques) es código propio en numpy
+y scipy. Las razones:
+
+- **La física del equipo.** SimPEG modela de forma nativa un lazo cuadrado real (`LineCurrent`), el
+  receptor en su posición, una forma de onda arbitraria (`PiecewiseLinearWaveform` con la `TX_RAMP` de
+  cada momento) e integra cada gate en su ventana. Con un WalkTEM, la rampa de apagado y el ancho de
+  los gates pesan mucho en los tiempos tempranos.
+- **El soporte de pyGIMLi para TDEM es más limitado.** Su fuerte es la inversión (marcos de
+  regularización, ERT 2D/3D, inversión acoplada), y por eso es lo que usa TlalliRes1D SEV. Hasta donde
+  conozco, su modelado TDEM 1D es más básico (dipolo, ρa) y para formas de onda reales habría que
+  acoplarlo con empymod.
+- **Instalación.** SimPEG se instala con pip; pyGIMLi se instala más cómodamente con conda.
+- **Auditoría.** Se usa solo la física de SimPEG, no su marco de inversión por *directivas*. El ciclo
+  propio deja explícita cada decisión (elección de λ, límites, DOI, bloques) en unas decenas de líneas
+  revisables, y la pantalla 3 la reporta en «Proceso de inversión aplicado».
 
 ## Pantallas
 
@@ -116,13 +135,26 @@ sondeo. El modelo se validó así:
 - contra la solución analítica de semiespacio (error < 0.3 % a 100 Ω·m);
 - el jacobiano, contra diferencias finitas.
 
-**Paso 1: multicapa.** Usa 30 capas logarítmicas hasta 1.5 × la profundidad de difusión del
-último gate y arranca en un semiespacio con la ρa tardía mediana. La inversión es
-Gauss–Newton en ln ρ con suavidad de primer orden; λ baja a la mitad en cada iteración
-hasta alcanzar χ² = 1. Si χ² = 1 no se alcanza, se elige el modelo más suave cuyo χ² está a
-menos del 10 % del mínimo, en vez del más rugoso.
+**Paso 1: multicapa (Occam con límites).** Usa 30 capas logarítmicas hasta 1.5 × la profundidad de
+difusión del último gate. La regularización es la rugosidad (primera diferencia de ln ρ) más un término
+de cercanía (α = 0.01) al semiespacio de referencia, que es la ρa tardía mediana. λ se elige al estilo
+Occam (Constable et al., 1987): en cada iteración se resuelve el modelo completo para 9 valores de λ,
+se calcula el χ² real de cada uno con el modelado directo y se queda el **λ más grande que cumple el
+objetivo**. Hay dos fases:
 
-**Paso 2: DOI.** Sigue a Oldenburg–Li: se hacen dos inversiones más con referencias ×10 y
+1. Bajar el desajuste hasta χ² = 1 o hasta que deje de mejorar. Ese es el χ² mínimo alcanzable.
+2. Si χ² = 1 no se alcanza, tomar el modelo más suave con χ² ≤ 1.2 × ese mínimo (la tolerancia es
+   editable).
+
+**Límites de resistividad.** Por omisión van del mínimo al máximo de la ρa tardía de los gates
+invertidos, ÷ y × 3; también se pueden fijar a mano. Se imponen por conjunto activo: las celdas que
+violan un límite se fijan en él y se re-resuelve el resto, que es más correcto que recortar. Si una
+celda queda en el límite, la app avisa: casi siempre es un tramo de datos que el modelo 1D no explica.
+
+En S001 esto pasó de un multicapa de 0.47–499 Ω·m (rugosidad 39) a uno de 1–149 Ω·m (rugosidad 13).
+La versión anterior (enfriamiento de λ) sigue disponible como opción.
+
+**Paso 2: DOI.** Sigue a Oldenburg–Li: se hacen dos inversiones más (λ fijo, sin límites, para no falsear la sensibilidad) con referencias ×10 y
 ÷10 del semiespacio. La DOI es la profundidad desde la que el índice supera 0.1, buscada
 desde el fondo.
 
@@ -133,7 +165,9 @@ desde el fondo.
 - El ajuste usa `scipy.optimize.least_squares` (trf) con la parametrización
   `h_i = h_min,i + exp(w_i)`. El espesor mínimo es el 20 % de la profundidad del techo, y la
   primera capa no puede ser más delgada que la primera celda del multicapa.
-- ρ queda acotada al rango del multicapa ±1 década.
+- ρ queda dentro de los mismos límites del multicapa y se regulariza hacia la media logarítmica del
+  multicapa en la profundidad de cada bloque (previa de ±0.5 décadas, editable). Un bloque solo se aleja
+  del modelo suave si los datos lo piden. La previa también entra en la covarianza de los rangos ±1σ.
 - La última interfaz no puede pasar del fondo de la malla del multicapa (penalización tipo bisagra).
   Sin ese tope, cuando los datos no ven el fondo, la interfaz podía irse a cientos de km.
 
