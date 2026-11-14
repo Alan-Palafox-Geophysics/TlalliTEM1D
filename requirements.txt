@@ -1,0 +1,27 @@
+# Dependencias de TLALLI-RES 1D TDEM.
+#
+# SimPEG trae el modelado 1D de capas (Simulation1DLayered, vía libdlf para
+# los filtros digitales de Hankel y de tiempo). Se instala por pip sin conda.
+# Probado con simpeg 0.26, discretize 0.13 y Python 3.13.
+
+streamlit>=1.40
+streamlit-authenticator>=0.4
+
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.4
+matplotlib>=3.8
+
+simpeg>=0.26,<0.27
+discretize>=0.11
+
+pyproj>=3.6
+
+pyarrow>=15.0
+duckdb>=1.0
+
+plotly>=5.20
+
+PyYAML>=6.0
+Pillow>=10.0
