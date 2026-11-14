@@ -230,9 +230,15 @@ else:
 c = st.columns([1, 1, 2])
 vista = c[0].radio("Ajuste en", ["dbdt", "rho_a"], horizontal=True, key="rad_vista",
                    format_func=lambda k: {"dbdt": "dB/dt", "rho_a": "ρa tardía"}[k])
+# Profundidad por omisión del gráfico: 1.6 × la última interfaz del modelo
+# de bloques o 1.2 × la DOI, la mayor. Se acota al rango del control
+# porque un modelo con una interfaz muy profunda (datos que no ven el
+# fondo) daría un valor por omisión fuera de rango y Streamlit se detiene.
+Z_GRAFICO_MIN, Z_GRAFICO_MAX = 5.0, 1e5
 _bases = bloques["z_base"].replace(np.inf, np.nan).dropna()
 _z_def = max(1.6 * float(_bases.max()) if len(_bases) else 100.0, doi * 1.2 if doi else 0.0, 50.0)
-z_graf = c[1].number_input("Profundidad del gráfico (m)", 5.0, 1e5, float(round(_z_def, 0)), key="n_zgraf")
+_z_def = float(np.clip(round(_z_def, 0), Z_GRAFICO_MIN, Z_GRAFICO_MAX)) if np.isfinite(_z_def) else 100.0
+z_graf = c[1].number_input("Profundidad del gráfico (m)", Z_GRAFICO_MIN, Z_GRAFICO_MAX, _z_def, key="n_zgraf")
 c = st.columns(2)
 c[0].plotly_chart(gr.ajuste_inversion(ajuste, vista=vista), use_container_width=True)
 c[1].plotly_chart(gr.modelos_resistividad(multicapa, bloques, doi=doi, real=referencia, z_max=z_graf),

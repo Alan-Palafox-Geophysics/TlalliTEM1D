@@ -57,18 +57,42 @@ cp = config.procesamiento
 with st.container(border=True):
     st.subheader("Apilado y selección de gates")
     st.caption(
-        "Cada gate se apila por separado: mediana y MAD (×1.4826) para marcar barridos atípicos, y media de "
-        "los que quedan; el error es el error estándar de la media. Un gate es **útil** si es positivo, su "
-        "SNR (dato / error estándar) supera el mínimo y todos los gates anteriores del mismo momento lo son. "
-        "Un **repunte** es un gate cuya señal sube más de 3σ respecto al anterior: en un decaimiento 1D eso "
-        "no ocurre (polarización inducida, superparamagnetismo, acoplamiento o ruido)."
+        "**Paso 1 · barridos completos.** Isolation Forest y LOF puntúan cada barrido como vector de "
+        "desviaciones normalizadas por gate; un barrido es atípico si su puntaje pasa de mediana + k·MAD de "
+        "los puntajes del sondeo (umbral adaptativo, no una fracción fija). "
+        "**Paso 2 · valores sueltos.** En cada gate, mediana y MAD de **log₁₀ ρa** de los barridos que quedan "
+        "y descarte a más de k MAD: el corte es relativo y no depende de la resistividad real. En gates "
+        "dominados por ruido (muchos barridos negativos, sin log) el mismo corte se hace en dB/dt lineal. "
+        "**Paso 3.** Media lineal de lo que queda y error estándar; la ρa se calcula sobre la curva apilada. "
+        "Un gate es **útil** si es positivo, su SNR supera el mínimo y todos los anteriores lo son; un "
+        "**repunte** es una subida de más de 3σ (no ocurre en un decaimiento 1D)."
     )
+    cb = st.columns(4)
+    DETECCION = {"if_lof": "Isolation Forest + LOF", "ninguna": "Desactivada"}
+    cp.deteccion_barridos = cb[0].selectbox("Paso 1 · detección por barrido", list(DETECCION),
+                                            index=list(DETECCION).index(cp.deteccion_barridos),
+                                            format_func=lambda k: DETECCION[k], key="sel_det")
+    CONSENSO = {"ambos": "Descartar si coinciden ambos", "cualquiera": "Descartar si lo marca cualquiera"}
+    cp.consenso = cb[1].selectbox("Criterio", list(CONSENSO), index=list(CONSENSO).index(cp.consenso),
+                                  format_func=lambda k: CONSENSO[k], key="sel_cons",
+                                  disabled=cp.deteccion_barridos == "ninguna",
+                                  help="«Cualquiera» descarta más barridos; con ruido gaussiano suele quitar "
+                                       "cola normal del ruido y subestimar el error.")
+    cp.k_puntaje = float(cb[2].number_input("Umbral del puntaje (k·MAD)", 1.0, 10.0, float(cp.k_puntaje), 0.5,
+                                            key="n_kpunt", disabled=cp.deteccion_barridos == "ninguna"))
+    cp.max_frac_descartados = float(cb[3].number_input("Máximo descartado (%)", 1.0, 50.0,
+                                                       float(100 * cp.max_frac_descartados), 1.0, key="n_maxdesc",
+                                                       disabled=cp.deteccion_barridos == "ninguna")) / 100
     cc = st.columns(5)
-    cp.k_mad = float(cc[0].number_input("Umbral de atípico |z| (MAD)", 2.0, 20.0, float(cp.k_mad), 0.5, key="n_kmad"))
-    cp.snr_min = float(cc[1].number_input("SNR mínimo", 1.0, 50.0, float(cp.snr_min), 0.5, key="n_snr"))
-    cp.factor_rampa = float(cc[2].number_input("Efecto de rampa: t < f·rampa, f =", 0.5, 10.0,
+    cp.k_mad = float(cc[0].number_input("Paso 2 · umbral por gate (k·MAD)", 2.0, 20.0, float(cp.k_mad), 0.5,
+                                        key="n_kmad"))
+    cp.snr_regimen_log = float(cc[1].number_input("SNR por barrido para usar log ρa", 1.0, 50.0,
+                                                  float(cp.snr_regimen_log), 0.5, key="n_snrlog"))
+    cp.snr_min = float(cc[2].number_input("SNR mínimo del gate apilado", 1.0, 50.0, float(cp.snr_min), 0.5,
+                                          key="n_snr"))
+    cp.factor_rampa = float(cc[3].number_input("Efecto de rampa: t < f·rampa, f =", 0.5, 10.0,
                                                float(cp.factor_rampa), 0.5, key="n_frampa"))
-    cp.excluir_repuntes = cc[3].checkbox("No invertir repuntes", value=bool(cp.excluir_repuntes), key="chk_rep")
+    cp.excluir_repuntes = cc[4].checkbox("No invertir repuntes", value=bool(cp.excluir_repuntes), key="chk_rep")
     cp.excluir_efecto_rampa = cc[4].checkbox("No invertir gates con efecto de rampa",
                                              value=bool(cp.excluir_efecto_rampa), key="chk_rampa",
                                              help=("La forma de onda del archivo ya se modela en la inversión; "
@@ -111,8 +135,10 @@ metricas = acc.metricas_sondeo(proyecto, sondeo)
 # ----------------------------------------------------------------------
 ICONOS = {"Buena": "🟢", "Aceptable": "🟡", "Revisar": "🟠", "Deficiente": "🔴"}
 valoracion = str(metricas.get("apilado.valoracion", "—"))
-t = st.columns(5)
+t = st.columns(6)
 t[0].metric("Valoración", f"{ICONOS.get(valoracion, '')} {valoracion}")
+t[5].metric("Barridos descartados", int(metricas.get("apilado.n_barridos_descartados", 0)),
+            help=f"{100 * float(metricas.get('apilado.frac_barridos_descartados', 0) or 0):.1f} % por IF + LOF (paso 1).")
 t[1].metric("Puntaje", f"{metricas.get('apilado.puntaje', np.nan):.0f} / 100",
             help="100 − 25 por cada falla − 8 por cada aviso (el peor de los momentos).")
 t[2].metric("Gates para invertir", int(metricas.get("apilado.n_para_invertir", 0)))
@@ -122,6 +148,13 @@ t[4].metric("Cambio LM → HM", f"{t_cambio * 1e6:.0f} µs" if t_cambio and np.i
             help="Desde este tiempo la curva combinada usa el HM (su error relativo ya es menor que el del LM).")
 
 st.plotly_chart(gr.curvas_decaimiento(gates, apilado), use_container_width=True)
+puntajes = estado.cargar_tabla("apilado", "barridos_qc")
+with st.expander("Paso 1 · anomalía por barrido (Isolation Forest y LOF)", expanded=False):
+    st.caption("Barridos descartados agrupados en el orden de adquisición indican ruido en ráfagas (tráfico, "
+               "maquinaria, tormenta); puntos aislados, picos sueltos.")
+    cpz = st.columns(2)
+    cpz[0].plotly_chart(gr.puntajes_barridos(puntajes, "LM"), use_container_width=True)
+    cpz[1].plotly_chart(gr.puntajes_barridos(puntajes, "HM"), use_container_width=True)
 st.plotly_chart(gr.curva_combinada(curva, t_cambio), use_container_width=True)
 st.caption("La curva combinada es para ver e interpretar (ρa, pseudosección). La inversión usa **los dos "
            "momentos por separado**, cada uno con su forma de onda y sus ventanas: en el solape aportan dos "
@@ -161,8 +194,10 @@ with st.container(border=True):
         "rampa…). Al guardar se rehace el apilado de este sondeo; después vuelva a invertirlo (pantalla 3)."
     )
     excl = pl.exclusiones_sondeo(proyecto, sondeo)
-    editor = apilado[["momento", "gate", "tiempo", "dbdt", "error_rel_se", "snr", "rho_a", "util", "repunte",
-                      "efecto_rampa", "usar"]].copy()
+    columnas_editor = [c for c in ("momento", "gate", "tiempo", "dbdt", "error_rel_se", "snr", "rho_a",
+                                   "sigma_log10_rho", "regimen", "n_atipicos", "util", "repunte", "efecto_rampa",
+                                   "usar") if c in apilado]
+    editor = apilado[columnas_editor].copy()
     editor["excluir"] = [(m, int(g)) in set(zip(excl["momento"], excl["gate"].astype(int)))
                          for m, g in zip(editor["momento"], editor["gate"])]
     momento = st.radio("Momento", ["LM", "HM"], horizontal=True, key="rad_mom_excl")
@@ -176,6 +211,10 @@ with st.container(border=True):
             "error_rel_se": st.column_config.NumberColumn("error rel.", format="%.3f"),
             "snr": st.column_config.NumberColumn("SNR", format="%.0f"),
             "rho_a": st.column_config.NumberColumn("ρa (Ω·m)", format="%.3g"),
+            "sigma_log10_rho": st.column_config.NumberColumn("σ log₁₀ρa", format="%.4f",
+                                                             help="Incertidumbre de la ρa apilada en log₁₀."),
+            "regimen": st.column_config.TextColumn("MAD en", help="log = log₁₀ ρa; lineal = dB/dt (gate ruidoso)"),
+            "n_atipicos": st.column_config.NumberColumn("atíp. MAD"),
             "usar": st.column_config.CheckboxColumn("se invierte"),
             "excluir": st.column_config.CheckboxColumn("excluir"),
         })

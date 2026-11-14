@@ -905,3 +905,46 @@ def pseudoseccion(datos: pd.DataFrame, titulo: str = "Pseudosección: ρa tardí
                         **marcas_log(datos["z"]))
     figura.update_layout(template=PLANTILLA, height=380, title=titulo, margin=dict(l=60, r=20, t=50, b=40))
     return figura
+
+
+def puntajes_barridos(puntajes: Optional[pd.DataFrame], momento: str) -> go.Figure:
+    """Puntaje de anomalía de cada barrido (IF arriba, LOF abajo) con su umbral.
+
+    Los barridos descartados (ambos detectores, o el que indique la
+    configuración) se marcan en rojo. Dos paneles con su propia escala, en
+    vez de un eje doble: los puntajes de IF y LOF no son comparables.
+    """
+    if puntajes is None or len(puntajes) == 0 or puntajes["puntaje_if"].isna().all():
+        return _vacia("Sin detección por barrido (desactivada o con menos de 20 barridos)", 300)
+    else:
+        pass
+    p = puntajes[puntajes["momento"] == momento].sort_values("indice")
+    if p.empty:
+        return _vacia(f"Sin barridos {momento}", 300)
+    else:
+        pass
+    figura = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                           subplot_titles=("Isolation Forest", "Local Outlier Factor"))
+    for fila, (col, umbral, marca) in enumerate((("puntaje_if", "umbral_if", "atipico_if"),
+                                                 ("puntaje_lof", "umbral_lof", "atipico_lof")), start=1):
+        normales = p[~p["descartado"].astype(bool)]
+        descartados = p[p["descartado"].astype(bool)]
+        figura.add_trace(go.Scattergl(
+            x=normales["indice"], y=normales[col], mode="markers", name="Conservado", showlegend=fila == 1,
+            legendgroup="c", marker=dict(size=5, color=COLOR[momento], opacity=0.55,
+                                         symbol=np.where(normales[marca], "circle-open", "circle")),
+            hovertemplate="barrido %{x}<br>puntaje %{y:.3f}<extra></extra>"), row=fila, col=1)
+        figura.add_trace(go.Scattergl(
+            x=descartados["indice"], y=descartados[col], mode="markers", name="Descartado",
+            showlegend=fila == 1, legendgroup="d", marker=dict(size=9, color=COLOR["anomalo"], symbol="x"),
+            hovertemplate="barrido %{x} (descartado)<br>puntaje %{y:.3f}<extra></extra>"), row=fila, col=1)
+        figura.add_hline(y=float(p[umbral].iloc[0]), line=dict(color="#666", dash="dash", width=1), row=fila, col=1)
+    figura.update_xaxes(title="Barrido (orden de adquisición)", row=2, col=1)
+    figura.update_yaxes(title="puntaje", row=1, col=1)
+    figura.update_yaxes(title="LOF", row=2, col=1)
+    n_desc = int(p["descartado"].sum())
+    figura.update_layout(template=PLANTILLA, height=420,
+                         title=f"{momento}: anomalía por barrido · {n_desc} de {len(p)} descartados "
+                               "(línea = mediana + k·MAD de los puntajes)",
+                         legend=dict(orientation="h", y=-0.2), margin=dict(l=60, r=20, t=70, b=40))
+    return figura

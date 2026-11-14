@@ -444,12 +444,35 @@ class _Parametrizacion:
         return dh
 
 
+#: Peso de la penalización que mantiene la última interfaz dentro de la
+#: malla del multicapa (por unidad de ln z de exceso).
+PESO_TOPE_PROFUNDIDAD = 30.0
+
+
 def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
-                     param: _Parametrizacion, limites_ln_rho: tuple[float, float]) -> dict[str, Any]:
+                     param: _Parametrizacion, limites_ln_rho: tuple[float, float],
+                     z_tope: float = np.inf) -> dict[str, Any]:
+    """Ajuste de un modelo de k bloques por mínimos cuadrados acotados.
+
+    ``z_tope`` es la profundidad máxima permitida a la última interfaz
+    (el fondo de la malla del multicapa). Sin ese tope, cuando los datos
+    no ven el fondo, la última interfaz puede irse a cientos de km: cada
+    ``w`` admite hasta e¹² veces la profundidad anterior y el ajuste no
+    cambia. El tope se aplica como penalización tipo bisagra sobre
+    ln z_última (su derivada respecto a cada ``w`` vale 1).
+    """
     from scipy.optimize import least_squares
 
     k = len(ln_rho0)
+    if np.isfinite(z_tope):
+        z0 = np.minimum(np.asarray(z0, float), 0.95 * z_tope)
+    else:
+        pass
     w0 = param.desde_profundidades(z0)
+    ln_tope = np.log(z_tope) if np.isfinite(z_tope) else np.inf
+
+    def exceso(w):
+        return max(0.0, float(np.log(param.a_profundidades(w)[-1])) - ln_tope) if k > 1 else 0.0
 
     def separar(p):
         return p[:k], p[k:]
@@ -459,7 +482,8 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
 
     def residual(p):
         ln_rho, w = separar(p)
-        return -datos.residuales(datos.modelo.respuesta_bloques(np.exp(ln_rho), espesores(w)))
+        r = -datos.residuales(datos.modelo.respuesta_bloques(np.exp(ln_rho), espesores(w)))
+        return np.append(r, PESO_TOPE_PROFUNDIDAD * exceso(w))
 
     def jacobiano(p):
         ln_rho, w = separar(p)
@@ -468,7 +492,12 @@ def _ajustar_bloques(datos: DatosInversion, ln_rho0: np.ndarray, z0: np.ndarray,
         escala = (1.0 / datos.sigma_ln / d)[:, None]
         J_rho = J[:, :k] * escala
         J_w = (J[:, k:] * escala / h[None, :]) @ param.jacobiano_espesores(w)
-        return np.hstack([J_rho, J_w])
+        fila_tope = np.zeros(2 * k - 1)
+        if exceso(w) > 0:
+            fila_tope[k:] = PESO_TOPE_PROFUNDIDAD
+        else:
+            pass
+        return np.vstack([np.hstack([J_rho, J_w]), fila_tope])
 
     bajo, alto = limites_ln_rho
     p0 = np.concatenate([np.clip(ln_rho0, bajo + 0.01, alto - 0.01), w0])
@@ -515,6 +544,7 @@ def invertir_bloques(datos: DatosInversion, espesores_suave: np.ndarray, m_suave
     limites = (max(LN_RHO_MIN, float(m_suave.min()) - np.log(10.0)),
                min(LN_RHO_MAX, float(m_suave.max()) + np.log(10.0)))
     param = _Parametrizacion(h_min=float(espesores_suave[0]), fraccion=config.espesor_min_fraccion)
+    z_tope = float(np.sum(espesores_suave))  # fondo de la malla del multicapa
     valores_k = [int(config.k_fijo)] if config.k_fijo >= 2 else list(range(2, int(config.k_max) + 1))
     resultados, filas, notas = {}, [], []
     for k in valores_k:
@@ -527,7 +557,7 @@ def invertir_bloques(datos: DatosInversion, espesores_suave: np.ndarray, m_suave
         for etiqueta, factor in (("segmentación del multicapa", 1.0), ("interfaces × 0.7", 0.7),
                                  ("interfaces × 1.4", 1.4)):
             try:
-                ajuste = _ajustar_bloques(datos, ln_rho0, z0 * factor, param, limites)
+                ajuste = _ajustar_bloques(datos, ln_rho0, z0 * factor, param, limites, z_tope)
             except Exception as exc:  # un arranque malo no detiene la búsqueda
                 logger.warning("k=%d, arranque %s falló: %s", k, etiqueta, exc)
                 continue

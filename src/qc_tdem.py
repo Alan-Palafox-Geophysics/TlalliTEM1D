@@ -63,7 +63,7 @@ class ConfigQC:
     rho_a_max: float = 10000.0
     factor_pausa: float = 5.0
     tolerancia_usf_xyz: float = 1e-3
-    k_mad: float = 5.0
+    k_mad: float = 3.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -525,15 +525,27 @@ def revisar_barras_error(ctx: Contexto) -> list[Hallazgo]:
 
 
 def revisar_barridos_atipicos(ctx: Contexto) -> list[Hallazgo]:
+    """Barridos completos descartados por Isolation Forest + LOF (paso 1 del apilado).
+
+    Con ruido gaussiano el umbral adaptativo descarta ~1 % o menos. Una
+    fracción alta indica contaminación real (ráfagas de ruido cultural,
+    caídas de corriente) y conviene ver en qué parte del sondeo ocurrió.
+    """
     salida = []
-    por_barrido = pr.atipicos_por_barrido(ctx.gates, ctx.config.k_mad)
-    for momento, g in por_barrido.groupby("momento"):
-        frac = float((g["frac_atipicos"] > 0.2).mean())
+    if "n_barridos_descartados" not in ctx.apilado:
+        return salida
+    else:
+        pass
+    for momento, g in ctx.apilado.groupby("momento"):
+        n_desc = int(g["n_barridos_descartados"].iloc[0])
+        n_total = int(g["n_stacks"].max()) + n_desc
+        frac = n_desc / n_total if n_total else 0.0
         salida.append(ctx.hallazgo(
             momento, "datos", "barridos_atipicos",
             "OK" if frac <= ctx.config.frac_barridos_atipicos_aviso else "WARN",
-            f"{100 * frac:.1f} % de los barridos tienen más del 20 % de sus gates atípicos (picos). El apilado "
-            "robusto los descarta gate por gate.", frac, f"≤ {ctx.config.frac_barridos_atipicos_aviso}"))
+            f"{n_desc} de {n_total} barridos ({100 * frac:.1f} %) descartados completos por Isolation Forest + LOF "
+            "(umbral adaptativo). Después, cada gate descarta valores sueltos a más de 3 MAD en log₁₀ ρa.",
+            frac, f"≤ {ctx.config.frac_barridos_atipicos_aviso}"))
     return salida
 
 

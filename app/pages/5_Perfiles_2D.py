@@ -166,7 +166,8 @@ c = st.columns([2, 1, 1])
 seleccion = c[0].multiselect("Secciones a mostrar", disponibles, default=[k for k in disponibles][:3],
                              format_func=lambda k: OPCIONES[k], key="ms_secciones")
 z_max = c[1].number_input("Profundidad máxima (m)", 0.0, 5000.0,
-                          float(round(np.median(list(dois.values())))) if dois else 0.0, key="n_zmax_sec",
+                          float(np.clip(round(np.median(list(dois.values()))), 0.0, 5000.0)) if dois else 0.0,
+                          key="n_zmax_sec",
                           help="Por defecto la DOI mediana de los sondeos; 0 = la mayor DOI.")
 mostrar_doi = c[2].checkbox("Marcar DOI", value=True, key="chk_doi_sec")
 escala = estado.escala_color_activa()

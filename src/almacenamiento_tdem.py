@@ -88,7 +88,7 @@ ETAPAS: dict[str, str] = {
 
 TABLAS_POR_ETAPA: dict[str, tuple[str, ...]] = {
     "crudo": ("meta", "barridos", "gates", "forma_onda", "ventanas", "modelo_referencia"),
-    "apilado": ("apilado", "curva", "qc", "resumen_qc", "exclusiones"),
+    "apilado": ("apilado", "curva", "qc", "resumen_qc", "barridos_qc", "exclusiones"),
     "inversion": ("multicapa", "bloques", "ajuste", "seleccion", "iteraciones", "proceso"),
     "parametros": ("parametros", "unidades", "resumen_unidades", "qc_campana"),
     "perfiles": ("perfil_sondeos", "perfil_ruta"),

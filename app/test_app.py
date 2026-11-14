@@ -171,17 +171,71 @@ def prueba_coordenadas_texto():
 def prueba_apilado_robusto():
     tablas = _tablas("SINT_001")
     gates = tablas.gates.copy()
-    # Un barrido con una espiga enorme en todos sus gates: el apilado
-    # robusto lo debe marcar como atípico y la media no debe moverse.
+    # Un barrido con una espiga enorme en todos sus gates: IF + LOF lo deben
+    # descartar completo y la curva apilada no debe moverse.
     primero = gates["barrido"].min()
     limpio = pr.apilar(gates, tablas.barridos, pr.ConfigProcesamiento())
     gates.loc[gates["barrido"] == primero, "dbdt"] *= 50
-    sucio = pr.apilar(gates, tablas.barridos, pr.ConfigProcesamiento())
-    # En los gates con señal (los primeros del LM) la espiga es inconfundible.
-    lm = sucio[(sucio["momento"] == "LM") & (sucio["gate"] <= 10)]
-    assert (lm["n_atipicos"] >= 1).all(), lm[["gate", "n_atipicos"]]
+    puntajes = pr.puntuar_barridos(gates, tablas.barridos, pr.ConfigProcesamiento())
+    assert bool(puntajes.set_index("barrido").loc[primero, "descartado"]), puntajes.head()
+    sucio = pr.apilar(gates, tablas.barridos, pr.ConfigProcesamiento(), puntajes=puntajes)
     relacion = (sucio["dbdt"] / limpio["dbdt"]).to_numpy()
     assert np.nanmax(np.abs(relacion[:10] - 1)) < 0.05
+    # Sin el paso 1, el MAD por gate (en log ρa) también lo atrapa gate por gate.
+    solo_mad = pr.apilar(gates, tablas.barridos, pr.ConfigProcesamiento(deteccion_barridos="ninguna"))
+    lm = solo_mad[(solo_mad["momento"] == "LM") & (solo_mad["gate"] <= 10)]
+    assert (lm["n_atipicos"] >= 1).all(), lm[["gate", "n_atipicos"]]
+
+
+def _usf_largo(nombre: str = "LARGO", n_barridos: int = 150, semilla: int = 7) -> lec.TablasSondeo:
+    """Sondeo sintético con más barridos (IF y LOF necesitan muestra)."""
+    carpeta = Path(tempfile.mkdtemp(prefix="tdem_largo_"))
+    try:
+        ruta = gs.escribir_usf(carpeta / f"{nombre}_2026_1112_090000.usf", nombre, (20.0, 40.0, 80.0),
+                               (60.0, 8.0, 40.0, 150.0), -103.34, 20.68, n_barridos=n_barridos, semilla=semilla)
+        return lec.leer_par(ruta, None)[0]
+    finally:
+        shutil.rmtree(carpeta, ignore_errors=True)
+
+
+def prueba_if_lof_ruido_gaussiano():
+    # Solo ruido gaussiano: el umbral adaptativo casi no debe descartar nada.
+    tablas = _usf_largo()
+    puntajes = pr.puntuar_barridos(tablas.gates, tablas.barridos, pr.ConfigProcesamiento(), 1600.0)
+    frac = puntajes.groupby("momento")["descartado"].mean()
+    assert (frac <= 0.03).all(), frac
+
+
+def prueba_if_lof_rafaga():
+    # Ráfaga de ruido en 10 barridos seguidos del LM (todos sus gates).
+    tablas = _usf_largo()
+    gates = tablas.gates.copy()
+    lm = sorted(gates.loc[gates["momento"] == "LM", "barrido"].unique())
+    rafaga = lm[60:70]
+    rng = np.random.default_rng(1)
+    afectados = gates["barrido"].isin(rafaga)
+    gates.loc[afectados, "dbdt"] *= np.exp(rng.normal(0, 0.15, afectados.sum()))
+    puntajes = pr.puntuar_barridos(gates, tablas.barridos, pr.ConfigProcesamiento(), 1600.0)
+    marcados = set(puntajes.loc[puntajes["descartado"], "barrido"])
+    assert len(marcados & set(rafaga)) >= 8, sorted(marcados)
+    falsos = len(marcados - set(rafaga)) / len(lm)
+    assert falsos <= 0.03, falsos
+
+
+def prueba_mad_log_relativo():
+    # El corte por MAD en log₁₀ ρa es relativo: escalar todo el sondeo (otro
+    # subsuelo, otra ρa) debe dar exactamente los mismos descartes.
+    tablas = _tablas("SINT_001")
+    cfg = pr.ConfigProcesamiento(deteccion_barridos="ninguna")
+    base = pr.apilar(tablas.gates, tablas.barridos, cfg, 1600.0)
+    escalado = tablas.gates.copy()
+    escalado["dbdt"] *= 37.0
+    otro = pr.apilar(escalado, tablas.barridos, cfg, 1600.0)
+    log = base["regimen"] == "log"
+    assert log.any()
+    assert (base.loc[log, "n_atipicos"].to_numpy() == otro.loc[log, "n_atipicos"].to_numpy()).all()
+    assert np.allclose(otro.loc[log, "dbdt"] / base.loc[log, "dbdt"], 37.0)
+    assert np.allclose(otro.loc[log, "sigma_log10_rho"], base.loc[log, "sigma_log10_rho"])
 
 
 def prueba_repunte_y_exclusiones():

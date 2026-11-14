@@ -12,7 +12,8 @@ Etapa           Qué hace
 ``crudo``       Lectura del USF (prioridad) y del XYZ, tablas de barridos,
                 gates, ventanas y forma de onda; registro en el catálogo
                 con coordenadas del archivo (si las trae).
-``apilado``     Apilado robusto por gate, gates útiles, exclusiones del
+``apilado``     Barridos atípicos (IF + LOF), MAD por gate en log₁₀ ρa,
+                media lineal; gates útiles, exclusiones del
                 usuario, ρa tardía, curva combinada LM+HM y control de
                 calidad (18 revisiones).
 ``inversion``   Multicapa suave (SimPEG) → DOI → modelo de bloques.
@@ -436,7 +437,8 @@ def ejecutar_apilado(proyecto: Proyecto, sondeo: str, config: Optional[ConfigPip
         meta = meta_sondeo(proyecto, sondeo)
         geometria = geometria_sondeo(proyecto, sondeo)
 
-        apilado = pr.apilar(gates, barridos, cfg.procesamiento)
+        puntajes = pr.puntuar_barridos(gates, barridos, cfg.procesamiento, geometria.area, geometria.vueltas)
+        apilado = pr.apilar(gates, barridos, cfg.procesamiento, geometria.area, geometria.vueltas, puntajes)
         apilado = pr.aplicar_exclusiones(apilado, exclusiones_sondeo(proyecto, sondeo), cfg.procesamiento)
         apilado = pr.agregar_rho_a(apilado, geometria.area, geometria.vueltas)
         curva, t_cambio = pr.combinar_momentos(apilado, cfg.procesamiento.factor_rampa)
@@ -452,6 +454,8 @@ def ejecutar_apilado(proyecto: Proyecto, sondeo: str, config: Optional[ConfigPip
             "n_para_invertir": int(apilado["usar"].sum()),
             "n_excluidos_usuario": int(apilado["excluido_usuario"].sum()),
             "puntaje": float(total["puntaje"]) if total is not None else np.nan,
+            "n_barridos_descartados": int(puntajes["descartado"].sum()) if len(puntajes) else 0,
+            "frac_barridos_descartados": float(puntajes["descartado"].mean()) if len(puntajes) else 0.0,
             "valoracion": str(total["valoracion"]) if total is not None else "",
             "config": json.dumps(cfg.procesamiento.as_dict(), default=str),
         }
@@ -460,11 +464,14 @@ def ejecutar_apilado(proyecto: Proyecto, sondeo: str, config: Optional[ConfigPip
             alm.guardar_tabla(proyecto, curva, "apilado", "curva", sondeo)
             alm.guardar_tabla(proyecto, hallazgos, "apilado", "qc", sondeo)
             alm.guardar_tabla(proyecto, resumen, "apilado", "resumen_qc", sondeo)
+            alm.guardar_tabla(proyecto, puntajes, "apilado", "barridos_qc", sondeo)
         else:
             pass
         n_aviso = int((hallazgos["severidad"] == "WARN").sum())
         n_falla = int((hallazgos["severidad"] == "FAIL").sum())
-        mensaje = (f"{metricas['n_para_invertir']} gates para invertir "
+        mensaje = (f"{metricas['n_barridos_descartados']} barrido(s) descartado(s) por IF+LOF "
+                   f"({100 * metricas['frac_barridos_descartados']:.1f} %); "
+                   f"{metricas['n_para_invertir']} gates para invertir "
                    f"({metricas['n_excluidos_usuario']} excluidos a mano); QC: {metricas['valoracion']} "
                    f"({n_falla} FAIL, {n_aviso} WARN).")
         return ResultadoEtapa(True, "apilado", mensaje, metricas=metricas,

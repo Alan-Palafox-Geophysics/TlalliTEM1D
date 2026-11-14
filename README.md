@@ -8,7 +8,8 @@ hace con **SimPEG**.
 
 ```
 USF (prioridad) + XYZ opcional, emparejados por la marca del stb
-→ apilado robusto por gate (mediana/MAD + media, error estándar, SNR)
+→ barridos atípicos (Isolation Forest + LOF, umbral adaptativo)
+→ MAD por gate en log₁₀ ρa (k = 3) → media lineal, error estándar, SNR
 → control de calidad: 18 revisiones por sondeo + revisiones de campaña
 → exclusión manual de gates → curva combinada LM + HM y ρa tardía
 → 1. multicapa suave (SimPEG, Gauss–Newton con λ enfriándose)
@@ -33,7 +34,7 @@ sirven las mismas cuentas.
 Pruebas sin navegador:
 
 ```bash
-python app/test_app.py          # 21 pruebas, ~1 min
+python app/test_app.py          # 24 pruebas, ~1 min
 python app/test_app.py rapido   # sin las inversiones completas, ~6 s
 ```
 
@@ -72,11 +73,29 @@ coordenadas.
 
 ## Decisiones de método
 
-**Apilado.** Cada gate se apila por separado. La mediana y la MAD (×1.4826) marcan como
-atípicos los barridos con |z| > 5; la media de los que quedan es el dato y su error
-estándar es el error. Un gate es *útil* si es positivo, su SNR es ≥ 3 y todos los gates
-anteriores del mismo momento también lo son. Un *repunte* es un gate cuya señal sube más
-de 3σ respecto al anterior; por omisión no se invierte.
+**Apilado (tres pasos).**
+
+1. **Barridos completos: Isolation Forest + LOF.** Cada barrido se trata como un vector de desviaciones
+   normalizadas por gate (en log₁₀ ρa donde el gate tiene señal). Cada detector da un puntaje y marca el
+   barrido si supera **mediana + 3·MAD de los puntajes del sondeo**. Por omisión se descarta cuando
+   coinciden ambos detectores, con un tope de seguridad del 20 %. No se usa la fracción de
+   contaminación automática de Isolation Forest: en los datos de campo marcaba el 5–14 % de los
+   barridos, que eran solo la cola normal del ruido gaussiano, y quitarlos subestimaba el error. Con el
+   umbral adaptativo se descarta el 0.6–5 %, y lo descartado tiene el doble de dispersión que el resto
+   y llega en ráfagas.
+2. **Valores sueltos: MAD por gate, k = 3, en log₁₀ ρa.** Se calcula la ρa de cada barrido, y luego su
+   mediana y su MAD en log. El corte es un factor de ρa, independiente del valor real de resistividad.
+   Si cada barrido individual tiene SNR < 3, muchos valores son negativos y el log no existe. En esos
+   gates el mismo corte se hace en dB/dt lineal: promediar en log ahí sesgaría la curva (en campo, la
+   ρa tardía salía 2 a 10 veces menor).
+3. **Valor apilado: media lineal de dB/dt** de lo que queda, con su error estándar. La ρa se calcula
+   sobre la curva apilada, con su banda ±1σ en log₁₀ ρa (`sigma_log10_rho`, `rho_a_min/max`).
+
+Después, un gate es *útil* si es positivo, su SNR es ≥ 3 y todos los gates anteriores del mismo
+momento también lo son. Un *repunte* es un gate cuya señal sube más de 3σ respecto al anterior; por
+omisión no se invierte. Los detectores solo ven ruido que **cambia entre barridos**. El ruido
+coherente (acoplamiento, meseta tardía) está en todos los barridos por igual y se maneja excluyendo
+gates.
 
 **Error para invertir.** Es el error estándar del apilado ⊕ un piso del 3 % del dato
 (editable). El piso cubre lo que el apilado no ve: calibración, forma de onda y efectos
@@ -115,6 +134,8 @@ desde el fondo.
   `h_i = h_min,i + exp(w_i)`. El espesor mínimo es el 20 % de la profundidad del techo, y la
   primera capa no puede ser más delgada que la primera celda del multicapa.
 - ρ queda acotada al rango del multicapa ±1 década.
+- La última interfaz no puede pasar del fondo de la malla del multicapa (penalización tipo bisagra).
+  Sin ese tope, cuando los datos no ven el fondo, la interfaz podía irse a cientos de km.
 
 El número de capas se elige por BIC (o AIC). Si dos modelos difieren en menos de 2, gana el
 más simple. Los errores se escalan por max(1, χ²_multicapa) para que un ajuste imperfecto no
